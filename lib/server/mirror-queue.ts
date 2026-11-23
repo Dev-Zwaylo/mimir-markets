@@ -1,5 +1,6 @@
 /*
- * What a basket subscriber has not mirrored yet.
+ * What a basket subscriber has not mirrored yet, and why past suggestions are
+ * no longer actionable.
  *
  * Following a basket records an intent; it cannot move money on its own. Soroban
  * has no `msg.sender` for a top-level call, so the staking account is an explicit
@@ -37,6 +38,7 @@ import {
 } from "@/lib/baskets";
 import { isHash32Hex } from "@/lib/content-hash";
 import { getChallengersByClaimId, getClaimsByFilter, listBasketSubscriptions } from "@/lib/db";
+import { computeMirrorAmountAtomic, toUsdcAtomic } from "@/lib/baskets";
 import { allBasketDefinitions } from "./basket-directory";
 import { listDirectoryAgents } from "./agent-directory";
 import { parseAddressParam } from "./api-validation";
@@ -49,10 +51,10 @@ export interface PendingMirror {
   /** The member whose position is being copied. */
   agentId: string;
   agentName: string;
-  /** What that member staked, display USDC. */
-  memberStakeUsdc: number;
-  /** What the subscriber would stake: their per-market cap scaled by weight. */
-  mirrorUsdc: number;
+  /** What that member staked, in exact 7-decimal atomic USDC units (base-10 integer string). */
+  memberStakeAtomic: string;
+  /** What the subscriber would stake: per-market cap scaled by weight, in exact 7-decimal atomic USDC units. */
+  mirrorAmountAtomic: string;
   weightBps: number;
   deadline: number;
   /** Version of the basket composition snapshot this preview was built from. */
@@ -144,6 +146,12 @@ export interface MirrorQueueDependencies {
   listDefinitions: () => Promise<MirrorQueueBasketDefinition[]>;
   listAgents: () => Promise<Array<{ id: string; displayName: string; address: string }>>;
   listOpenClaims: () => Promise<Array<{ id: number; question?: string | null; deadline: number; creator?: string | null }>>;
+  /**
+   * Recently closed/resolved claims. Used to surface `closed_market`
+   * ineligibility for claims that an agent staked on but that have since
+   * settled. Defaults to the last 50 resolved claims ordered by deadline.
+   */
+  listClosedClaims: () => Promise<Array<{ id: number; question?: string | null; deadline: number; creator?: string | null }>>;
   listChallengers: (claimId: number) => Promise<Array<{ address: string; stake: number }>>;
   listReviewedCompositions?: (wallet: string) => Promise<Record<string, ReviewedBasketComposition>>;
   materialDriftBps?: number;
@@ -155,6 +163,8 @@ const defaultDependencies: MirrorQueueDependencies = {
   listAgents: () => listDirectoryAgents(),
   listOpenClaims: () =>
     getClaimsByFilter({ states: ["open", "active"], orderBy: "deadline_asc", limit: 50 }),
+  listClosedClaims: () =>
+    getClaimsByFilter({ states: ["resolved", "settled"], orderBy: "deadline_desc", limit: 50 }),
   listChallengers: (claimId) => getChallengersByClaimId(claimId),
 };
 
@@ -409,6 +419,13 @@ export async function reviewPendingMirrorsFor(
   const nowMs = Date.now();
   const nowSeconds = Math.floor(nowMs / 1000);
 
+  // Cache challenger lookups per claim so shared claims across multiple baskets
+  // are queried once and failures are not double-counted.
+  const challengersByClaim = new Map<
+    number,
+    { ok: true; challengers: Array<{ address: string; stake: number }> } | { ok: false }
+  >();
+
   const pending: PendingMirror[] = [];
   const snapshots: Record<string, BasketCompositionSnapshot> = {};
   const invalidated: InvalidatedBasketComposition[] = [];
@@ -444,13 +461,30 @@ export async function reviewPendingMirrorsFor(
     snapshots[basketId] = liveSnapshot;
     const budget = perMarketUsdc[basketId] ?? 2;
 
-    for (const claim of openClaims) {
-      // No point offering a mirror that cannot be staked before it settles.
-      if (claim.deadline <= nowSeconds + 300) continue;
+    // ── Closed-market ineligibility ──────────────────────────────────────────
+    // For each recently-closed claim where an agent in this basket had a
+    // position, record an ineligible entry so the subscriber can see why the
+    // suggestion disappeared.
+    for (const claim of closedClaims) {
+      const key = `${basketId}:${claim.id}`;
+      if (classified.has(key)) continue;
       if (claim.creator === wallet) continue;
       if (offeredClaims.has(claim.id)) continue;
 
-      const challengers = await dependencies.listChallengers(claim.id).catch(() => []);
+      let cached = challengersByClaim.get(claim.id);
+      if (!cached) {
+        try {
+          const challengers = await dependencies.listChallengers(claim.id);
+          cached = { ok: true, challengers };
+        } catch (error) {
+          recordFailure("challengers", error, claim.id);
+          cached = { ok: false };
+        }
+        challengersByClaim.set(claim.id, cached);
+      }
+      if (!cached.ok) continue;
+
+      const challengers = cached.challengers;
       const taken = new Set(challengers.map((c) => c.address));
       if (taken.has(wallet)) continue; // already mirrored, or acted independently
 
@@ -465,6 +499,7 @@ export async function reviewPendingMirrorsFor(
         // reject it anyway and the row would only be noise.
         if (mirrorUsdc <= 0) continue;
 
+        classified.add(key);
         pending.push({
           basketId,
           basketName: definition.name,

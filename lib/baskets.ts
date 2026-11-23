@@ -19,6 +19,43 @@ import { isValidBps } from "./money";
  * This means a captured basket-creation signature cannot be replayed to
  * insert duplicate baskets.
  */
+/**
+ * Deterministic composition revision (#892).
+ *
+ * A stable hash over the canonicalized member set (agentId ascending,
+ * tie-broken by weightBps). Two baskets with the same members in different
+ * input orders yield the same revision; any change to membership or weights
+ * yields a different revision. Uses DJB2 over the canonical string — small,
+ * dependency-free, and stable across hosts. Not a cryptographic hash: this
+ * is an equality check on an in-process value, not a security primitive.
+ */
+export function compositionRevision(
+  members: readonly { agentId: string; weightBps: number }[],
+): string {
+  const canonical = canonicalizeMembers(members);
+  let hash = 5381;
+  for (const member of canonical) {
+    const chunk = `${member.agentId}:${member.weightBps};`;
+    for (let i = 0; i < chunk.length; i++) {
+      hash = ((hash * 33) ^ chunk.charCodeAt(i)) >>> 0;
+    }
+  }
+  return `c${hash.toString(16).padStart(8, "0")}`;
+}
+
+/**
+ * True when a suggestion was built from a different composition than the
+ * one currently in force. Callers use this to reject a stale reviewed action
+ * before applying it, so new weights never silently override old consent.
+ */
+export function isSuggestionStale(
+  suggestion: { compositionRevision?: string },
+  currentMembers: readonly { agentId: string; weightBps: number }[],
+): boolean {
+  if (!suggestion.compositionRevision) return false;
+  return suggestion.compositionRevision !== compositionRevision(currentMembers);
+}
+
 export function basketMessage(args: {
   name: string;
   creator: string;
@@ -26,11 +63,16 @@ export function basketMessage(args: {
   nonce: string;
   expiresAt: number;
 }): string {
+  // Validate before serialization (#894): a signed message must not carry a
+  // contradictory composition. Canonicalize so signature bytes are stable
+  // regardless of the caller's array order.
+  validateBasketComposition(args.members);
+  const canonicalMembers = canonicalizeMembers(args.members);
   return [
     "Mimir basket",
     `name: ${args.name}`,
     `creator: ${args.creator}`,
-    `members: ${args.members.map((m) => `${m.agentId}:${m.weightBps}`).join(",")}`,
+    `members: ${canonicalMembers.map((m) => `${m.agentId}:${m.weightBps}`).join(",")}`,
     `nonce: ${args.nonce}`,
     `expiresAt: ${new Date(args.expiresAt).toISOString()}`,
   ].join("\n");
@@ -58,7 +100,7 @@ export const TRANSFER_EXPIRY_MS = 5 * 60_000; // 5 minutes
  * What the CURRENT owner signs to authorise a transfer.
  *
  * Both addresses are interpolated verbatim — Stellar strkeys are case-sensitive
- * base32 and must never be lowercased. The message now also includes:
+ * base32 and must never be lowercased. The message also includes:
  *
  *  - `nonce`     — a client-generated UUID, stored on the server after first use
  *                  so the same signed message is rejected on any replay attempt.
@@ -648,10 +690,19 @@ export function isMaterialCompositionChange(
 export interface BasketAgentWeight {
   agentId: string;
   weightBps: number;
+  /** Per-period returns for this member, as decimals (e.g. 0.01 = +1%). */
+  returns: number[];
+}
+
+export interface BasketAgentWeight {
+  agentId: string;
+  weightBps: number;
   category: string;
   mode: string;
   paused?: boolean;
   stale?: boolean;
+  /** Per-period returns for this member, as decimals (e.g. 0.01 = +1%). */
+  returns: number[];
 }
 export interface BasketReturnPoint {
   timestamp: number;
