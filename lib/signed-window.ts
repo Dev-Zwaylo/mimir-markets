@@ -34,19 +34,84 @@ export const PROPOSAL_EXPIRY_POLICY_REVISION = "proposal-expiry:v1";
 
 const NONCE_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
 
+/**
+ * Canonical digest input for a market draft that an owner approves. Approval
+ * is bound to these exact fields (wording, source commitment, stake, deadline);
+ * any later change to one of them must invalidate the approval.
+ */
+export interface MarketDraftCommitment {
+  wording: string;
+  sourceCommitment: string;
+  stake: number;
+  deadline: number;
+}
+
+/**
+ * Deterministic JSON serialisation of the approved draft fields with sorted
+ * keys, so equivalent drafts always produce the same canonical string.
+ */
+export function canonicalMarketDraft(draft: MarketDraftCommitment): string {
+  return JSON.stringify({
+    deadline: draft.deadline,
+    sourceCommitment: draft.sourceCommitment,
+    stake: draft.stake,
+    wording: draft.wording,
+  });
+}
+
+/** Non-cryptographic FNV-1a digest hex of the canonical draft, for binding checks. */
+export function marketDraftDigest(draft: MarketDraftCommitment): string {
+  const input = canonicalMarketDraft(draft);
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
+}
+
+/**
+ * Returns true only when the draft currently matches the digest that was
+ * approved. Any change to wording, source commitment, stake or deadline
+ * yields a different digest and must reject execution.
+ */
+export function isApprovedDraftCurrent(
+  draft: MarketDraftCommitment,
+  approvedDigest: string,
+): boolean {
+  return marketDraftDigest(draft) === approvedDigest;
+}
+
 export type SignedWindowResult =
   | { ok: true; nonce: string; expiresAt: number }
   | { ok: false; code: "invalid_request" | "request_expired"; message: string; field: "nonce" | "expiresAt" };
 
-/** Validate the nonce shape and that `expiresAt` is in (now, now + max TTL]. */
+/**
+ * Validate the nonce shape and that `expiresAt` is in (now, now + max TTL].
+ * Nonce whitespace is normalized for compatibility; timestamps must already be
+ * safe-integer millisecond numbers. Arrays are refused rather than selecting a
+ * value from a repeated parameter list.
+ */
 export function validateSignedWindow(
   rawNonce: unknown,
   rawExpiresAt: unknown,
-  now = Date.now(),
+  optionsOrNow: SignedWindowOptions | number = Date.now(),
+  maybeCurrentRevision?: number,
 ): SignedWindowResult {
+  if (Array.isArray(rawNonce)) {
+    return { ok: false, code: "invalid_request", message: "nonce must be provided exactly once", field: "nonce" };
+  }
   const nonce = typeof rawNonce === "string" ? rawNonce.trim() : "";
   if (!NONCE_PATTERN.test(nonce)) {
-    return { ok: false, code: "invalid_request", message: "nonce must be 16-128 characters of [A-Za-z0-9_-]", field: "nonce" };
+    return {
+      ok: false,
+      code: "invalid_request",
+      message: "nonce must be 16-128 characters of [A-Za-z0-9_-]",
+      field: "nonce",
+    };
+  }
+  if (Array.isArray(rawExpiresAt)) {
+    return { ok: false, code: "invalid_request", message: "expiresAt must be provided exactly once", field: "expiresAt" };
   }
   const expiresAt = typeof rawExpiresAt === "number" ? rawExpiresAt : Number.NaN;
   if (!Number.isSafeInteger(expiresAt) || expiresAt <= now) {
@@ -60,6 +125,20 @@ export function validateSignedWindow(
       field: "expiresAt",
     };
   }
+
+  if (options.expectedRevision !== undefined) {
+    const revisionCheck = validateReviewRevision(options.expectedRevision, currentRevision);
+    if (!revisionCheck.ok) {
+      return {
+        ok: false,
+        code: revisionCheck.code,
+        message: revisionCheck.message,
+        field: revisionCheck.field,
+      };
+    }
+    return { ok: true, nonce, expiresAt, expectedRevision: revisionCheck.expectedRevision };
+  }
+
   return { ok: true, nonce, expiresAt };
 }
 
