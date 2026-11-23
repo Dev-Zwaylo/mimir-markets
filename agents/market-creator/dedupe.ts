@@ -105,7 +105,11 @@ export function normaliseQuestion(question: string | undefined): string {
   if (!question) return "";
   return question
     .toLowerCase()
-    .replace(/[^a-z0-9]/g, " ")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/&/g, " and ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\b(will|does|do|did|the|their|a|an|in|on|at|by|before|after|during)\b/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -126,6 +130,52 @@ export function normaliseDeadline(deadline: string | number | undefined): string
   const parsedMs = Date.parse(deadline);
   if (!Number.isFinite(parsedMs)) return deadline.trim().toLowerCase();
   return new Date(parsedMs).toISOString();
+}
+
+function normaliseSnapshot(candidate: CandidateLike): string {
+  const source = (candidate.sourceId ?? "").trim().toLowerCase();
+  const version = (candidate.sourceVersion ?? candidate.captureVersion ?? "").trim().toLowerCase();
+  // Encode absent values distinctly so a missing snapshot never equals a real one.
+  return `${source}@${version}`;
+}
+
+/**
+ * Validate and canonicalise a resolution source URL.
+ * Requires http or https protocol and returns normalized URL href (without trailing slash on pathname).
+ * Returns null if URL is malformed, empty, or not http(s).
+ */
+export function canonicaliseResolutionSourceUrl(url: unknown): string | null {
+  if (typeof url !== "string") return null;
+  const trimmed = url.trim();
+  if (!trimmed) return null;
+
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return null;
+    }
+    const origin = parsed.origin.toLowerCase();
+    let pathname = parsed.pathname.replace(/\/+$/, "");
+    if (pathname === "" && !parsed.search && !parsed.hash) {
+      pathname = "";
+    }
+    const search = parsed.search;
+    return `${origin}${pathname}${search}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Check whether a string contains invalid UTF-16 text encoding (such as unpaired surrogates).
+ */
+export function hasInvalidTextEncoding(text: string): boolean {
+  try {
+    encodeURIComponent(text);
+    return false;
+  } catch {
+    return true;
+  }
 }
 
 /**
@@ -176,11 +226,30 @@ export function normalizeResolutionUrl(value: string | undefined): string {
 /**
  * Build a legacy candidate signature: question|url|deadline.
  */
-export function buildCandidateSignature(candidate: CandidateLike): string {
-  const question = normaliseQuestion(candidate.question ?? candidate.title);
-  const url = normaliseUrl(candidate.resolutionUrl);
+export function buildCandidateSignature(
+  candidate: CandidateLike,
+  policyVersion: string = NORMALIZATION_POLICY_VERSION,
+): string {
+  const question = normalizeComparableText(candidate.question ?? candidate.title);
+  const url = normalizeResolutionUrl(candidate.resolutionUrl);
   const deadline = normaliseDeadline(candidate.deadline);
-  return `${question}|${url}|${deadline}`;
+  const snapshot = normaliseSnapshot(candidate);
+  return `${policyVersion}|${question}|${url}|${deadline}|${snapshot}`;
+}
+
+/** Signature of an existing on-chain claim, for `filterDuplicateCandidates`. */
+export function buildExistingClaimSignature(claim: {
+  id: number;
+  category?: string;
+  question?: string;
+  resolution_url?: string;
+}): ExistingClaimSignature {
+  return {
+    id: claim.id,
+    category: normaliseCategory(claim.category),
+    questionKey: normalizeComparableText(claim.question),
+    resolutionUrlKey: normalizeResolutionUrl(claim.resolution_url),
+  };
 }
 
 /**
@@ -632,6 +701,7 @@ export function filterDuplicateCandidates<T extends CandidateLike>(
   }
 
   const out: T[] = [];
+
   for (const candidate of candidates) {
     const sig = buildCandidateSignature(candidate);
     const category = String(candidate.category ?? "").toLowerCase().trim();
@@ -693,4 +763,25 @@ export function filterDuplicateCandidates<T extends CandidateLike>(
   }
 
   return out;
+}
+
+/**
+ * Drop cached dedupe keys that were produced under a different normalization
+ * policy version. Keys are expected to carry their version as the prefix
+ * before the first '|'. Returns the number of keys removed.
+ */
+export function invalidateIncompatibleKeys(
+  seen: Set<string>,
+  policyVersion: string = NORMALIZATION_POLICY_VERSION,
+): number {
+  let removed = 0;
+  for (const key of [...seen]) {
+    const sep = key.indexOf("|");
+    const keyVersion = sep < 0 ? "" : key.slice(0, sep);
+    if (keyVersion !== policyVersion) {
+      seen.delete(key);
+      removed++;
+    }
+  }
+  return removed;
 }
